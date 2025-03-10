@@ -12,7 +12,7 @@ import { io } from 'socket.io-client';
 import axios from 'axios';
 
 // Initialize socket connection using your ngrok URL
-const socket = io('https://c5d7-182-177-61-68.ngrok-free.app/', {
+const socket = io('https://colt-immortal-bream.ngrok-free.app/', {
   transports: ['websocket'],
   withCredentials: true,
 });
@@ -164,7 +164,7 @@ function App() {
 
     // Send to backend
     axios
-      .post('https://c5d7-182-177-61-68.ngrok-free.app/process_text', { text: sampleQuestion })
+      .post('https://colt-immortal-bream.ngrok-free.app/process_text', { text: sampleQuestion })
       .then((response) => {
         setResponseText(response.data.response);
         addLog(`Response: ${response.data.response}`);
