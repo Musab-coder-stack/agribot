@@ -6,14 +6,16 @@ import {
   Leaf,
   Wheat,
   Info,
-  Settings,
   History,
 } from 'lucide-react';
 import { io } from 'socket.io-client';
 import axios from 'axios';
 
-// Initialize socket connection
-const socket = io('https://colt-immortal-bream.ngrok-free.app/');
+// Initialize socket connection using your ngrok URL
+const socket = io('https://c5d7-182-177-61-68.ngrok-free.app/', {
+  transports: ['websocket'],
+  withCredentials: true,
+});
 
 function App() {
   const [isListening, setIsListening] = useState(false);
@@ -29,9 +31,8 @@ function App() {
   const [activeTab, setActiveTab] = useState('main');
   const [systemReady, setSystemReady] = useState(true);
 
-  // Connect to backend
+  // Socket connection events
   useEffect(() => {
-    // Socket connection events
     socket.on('connect', () => {
       setConnectionStatus('connected');
       addLog('Connected to server');
@@ -85,7 +86,6 @@ function App() {
       setSystemReady(data.ready);
     });
 
-    // Cleanup on component unmount
     return () => {
       socket.off('connect');
       socket.off('disconnect');
@@ -97,6 +97,13 @@ function App() {
       socket.off('system_ready');
     };
   }, [transcribedText]);
+
+  // Auto-start listening when connected
+  useEffect(() => {
+    if (connectionStatus === 'connected' && systemReady && !isListening) {
+      toggleListening();
+    }
+  }, [connectionStatus]);
 
   // Periodically check if system is ready
   useEffect(() => {
@@ -157,7 +164,7 @@ function App() {
 
     // Send to backend
     axios
-      .post('https://colt-immortal-bream.ngrok-free.app/process_text', { text: sampleQuestion })
+      .post('https://c5d7-182-177-61-68.ngrok-free.app/process_text', { text: sampleQuestion })
       .then((response) => {
         setResponseText(response.data.response);
         addLog(`Response: ${response.data.response}`);
@@ -249,9 +256,7 @@ function App() {
                         ? 'bg-red-500 hover:bg-red-600'
                         : 'bg-green-600 hover:bg-green-700'
                     } text-white transition-all duration-300 shadow-lg hover:shadow-xl transform hover:scale-105`}
-                    disabled={
-                      connectionStatus === 'disconnected' || !systemReady
-                    }
+                    disabled={!systemReady}
                   >
                     {isListening ? <MicOff size={32} /> : <Mic size={32} />}
                   </button>
@@ -301,13 +306,6 @@ function App() {
                     </span>
                   )}
                 </div>
-
-                {connectionStatus === 'disconnected' && (
-                  <div className="mt-5 text-red-500 text-base bg-red-50 p-3 rounded-md border border-red-200">
-                    Backend server not connected. Make sure the Python backend
-                    is running.
-                  </div>
-                )}
 
                 <div className="mt-6">
                   <button
@@ -393,8 +391,7 @@ function App() {
 
               {conversationHistory.length === 0 ? (
                 <div className="text-gray-500 p-6 bg-green-50 rounded-md text-center text-lg">
-                  No conversation history yet. Start talking to AgriBot to see
-                  your conversations here.
+                  No conversation history yet. Start talking to AgriBot to see your conversations here.
                 </div>
               ) : (
                 <div className="space-y-8">
@@ -443,10 +440,7 @@ function App() {
                     <Leaf size={22} className="mr-2" /> What is AgriBot?
                   </h3>
                   <p className="text-gray-700 mb-5 text-lg leading-relaxed">
-                    AgriBot is an AI-powered voice assistant designed
-                    specifically for wheat farmers in Pakistan. It provides
-                    expert advice on wheat cultivation, pest control,
-                    irrigation, and other farming practices in Urdu language.
+                    AgriBot is an AI-powered voice assistant designed specifically for wheat farmers in Pakistan. It provides expert advice on wheat cultivation, pest control, irrigation, and other farming practices in Urdu language.
                   </p>
 
                   <h3 className="text-xl font-medium mb-4 text-green-700">
@@ -454,21 +448,16 @@ function App() {
                   </h3>
                   <ul className="list-disc pl-6 text-gray-700 space-y-2 mb-4 text-lg">
                     <li>
-                      <span className="font-medium">Speech Recognition:</span>{' '}
-                      Whisper Model for accurate Urdu speech recognition
+                      <span className="font-medium">Speech Recognition:</span> Whisper Model for accurate Urdu speech recognition
                     </li>
                     <li>
-                      <span className="font-medium">
-                        Voice Activity Detection:
-                      </span>{' '}
-                      Silero VAD for detecting when someone is speaking
+                      <span className="font-medium">Voice Activity Detection:</span> Silero VAD for detecting when someone is speaking
                     </li>
                     <li>
                       <span className="font-medium">AI Processing:</span> LLaMA 3.3 70B model for generating responses
                     </li>
                     <li>
-                      <span className="font-medium">Text-to-Speech:</span>{' '}
-                      ElevenLabs for natural-sounding Urdu voice responses
+                      <span className="font-medium">Text-to-Speech:</span> ElevenLabs for natural-sounding Urdu voice responses
                     </li>
                   </ul>
                 </div>
@@ -490,8 +479,7 @@ function App() {
                     Getting Started
                   </h3>
                   <p className="text-gray-700 text-lg leading-relaxed">
-                    Make sure the Python backend is running before using
-                    AgriBot. You can ask questions about:
+                    Make sure the Python backend is running before using AgriBot. You can ask questions about:
                   </p>
                   <ul className="list-disc pl-6 text-gray-700 space-y-2 mt-3 text-lg">
                     <li>Wheat planting times and techniques</li>
