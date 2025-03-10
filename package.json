@@ -8,6 +8,7 @@
     "build": "vite build",
     "lint": "eslint .",
     "preview": "vite preview",
+    "start":"vite build",
     "start-backend": "python backend.py"
   },
   "dependencies": {
