@@ -13,7 +13,7 @@ import { io } from 'socket.io-client';
 import axios from 'axios';
 
 // Initialize socket connection
-const socket = io('https://colt-immortal-bream.ngrok-free.app/');
+const socket = io('https://localhost:5000');
 
 function App() {
   const [isListening, setIsListening] = useState(false);
