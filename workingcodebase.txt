@@ -1,0 +1,846 @@
+import React, { useState, useEffect, useRef } from 'react';
+import {
+  Mic,
+  MicOff,
+  Volume2,
+  Leaf,
+  Wheat,
+  Info,
+  Settings,
+  History,
+} from 'lucide-react';
+import { io } from 'socket.io-client';
+import axios from 'axios';
+
+const socket = io('http://localhost:5000', { transports: ['websocket'] });
+
+function App() {
+  const [isListening, setIsListening] = useState(false);
+  const [speechProbability, setSpeechProbability] = useState(0);
+  const [transcribedText, setTranscribedText] = useState('');
+  const [responseText, setResponseText] = useState('');
+  const [isMicBlocked, setIsMicBlocked] = useState(false);
+  const [logs, setLogs] = useState([]);
+  const [connectionStatus, setConnectionStatus] = useState('disconnected');
+  const [conversationHistory, setConversationHistory] = useState([]);
+  const [activeTab, setActiveTab] = useState('main');
+  const [systemReady, setSystemReady] = useState(true);
+
+  const audioContextRef = useRef(null);
+  const scriptNodeRef = useRef(null);
+  const mediaStreamRef = useRef(null);
+  const playbackContextRef = useRef(null);
+
+  useEffect(() => {
+    socket.on('connect', () => {
+      setConnectionStatus('connected');
+      addLog('Connected to server');
+    });
+  
+    socket.on('disconnect', () => {
+      setConnectionStatus('disconnected');
+      addLog('Disconnected from server');
+    });
+  
+    socket.on('speech_probability', (data) => {
+      setSpeechProbability(data.probability);
+      addLog(`Speech probability: ${(data.probability * 100).toFixed(2)}%`);
+    });
+  
+    // Block mic when processing starts
+    socket.on('start_processing', () => {
+      setIsMicBlocked(true);
+      addLog('Mic input blocked: Processing started');
+    });
+  
+    socket.on('transcribed_text', (data) => {
+      setTranscribedText(data.text);
+      addLog(`Transcribed Text: ${data.text}`);
+      setSystemReady(false);
+    });
+  
+    socket.on('response', async (data) => {
+      setResponseText(data.text);
+      addLog(`Response: ${data.text}`);
+      setConversationHistory((prev) => [
+        ...prev,
+        { question: transcribedText, answer: data.text },
+      ]);
+  
+      try {
+        addLog('Playing audio response');
+        playbackContextRef.current = new (window.AudioContext || window.webkitAudioContext)({
+          sampleRate: 44100,
+        });
+        const audioBuffer = await playbackContextRef.current.decodeAudioData(data.audio);
+        const source = playbackContextRef.current.createBufferSource();
+        source.buffer = audioBuffer;
+        source.connect(playbackContextRef.current.destination);
+        source.onended = () => {
+          setIsMicBlocked(false); // Unblock mic after playback ends
+          setSystemReady(true);
+          addLog('Audio playback ended, mic input unblocked');
+          socket.emit('check_ready');
+          playbackContextRef.current.close();
+        };
+        source.start(0);
+      } catch (error) {
+        addLog(`Error playing audio: ${error.message}`);
+        setIsMicBlocked(false);
+        setSystemReady(true);
+      }
+    });
+  
+    socket.on('system_ready', (data) => {
+      setSystemReady(data.ready);
+      addLog(`System ready: ${data.ready}`);
+    });
+  
+    socket.on('error', (data) => {
+      addLog(`Server error: ${data.message}`);
+    });
+  
+    return () => {
+      socket.off('connect');
+      socket.off('disconnect');
+      socket.off('speech_probability');
+      socket.off('start_processing');
+      socket.off('transcribed_text');
+      socket.off('response');
+      socket.off('system_ready');
+      socket.off('error');
+    };
+  }, [transcribedText]);
+
+  useEffect(() => {
+    const readyCheckInterval = setInterval(() => {
+      if (connectionStatus === 'connected' && !isMicBlocked) {
+        socket.emit('check_ready');
+      }
+    }, 2000);
+    return () => clearInterval(readyCheckInterval);
+  }, [connectionStatus, isMicBlocked]);
+
+  const toggleListening = async () => {
+    if (connectionStatus === 'disconnected') {
+      addLog('Cannot start listening: Not connected to server');
+      return;
+    }
+    if (!systemReady) {
+      addLog('System is currently processing or playing. Please wait.');
+      return;
+    }
+
+    if (!isListening) {
+      try {
+        addLog('Initializing audio capture...');
+        const stream = await navigator.mediaDevices.getUserMedia({
+          audio: {
+            echoCancellation: true,
+            noiseSuppression: true,
+            sampleRate: 16000,
+            channelCount: 1,
+          },
+        });
+        mediaStreamRef.current = stream;
+        addLog('Microphone access granted');
+
+        audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)({
+          sampleRate: 16000,
+        });
+        const source = audioContextRef.current.createMediaStreamSource(stream);
+
+        scriptNodeRef.current = audioContextRef.current.createScriptProcessor(512, 1, 1);
+        scriptNodeRef.current.onaudioprocess = (event) => {
+          if (!isMicBlocked) {
+            const inputBuffer = event.inputBuffer.getChannelData(0);
+            const pcmData = new Float32Array(inputBuffer);
+            const arrayBuffer = pcmData.buffer;
+            addLog(`Sending PCM chunk, size: ${arrayBuffer.byteLength} bytes`);
+            socket.emit('audio_chunk', { audio: arrayBuffer });
+          }
+        };
+
+        source.connect(scriptNodeRef.current);
+        scriptNodeRef.current.connect(audioContextRef.current.destination);
+
+        setIsListening(true);
+        addLog('Listening state activated');
+        setTranscribedText('');
+        setResponseText('');
+        socket.emit('start_listening');
+      } catch (error) {
+        addLog(`Microphone access failed: ${error.message}`);
+      }
+    } else {
+      if (audioContextRef.current) {
+        audioContextRef.current.close();
+        mediaStreamRef.current.getTracks().forEach((track) => track.stop());
+        audioContextRef.current = null;
+        scriptNodeRef.current = null;
+        mediaStreamRef.current = null;
+        setIsListening(false);
+        addLog('Listening stopped by user');
+        socket.emit('stop_listening');
+      }
+    }
+  };
+
+  const addLog = (message) => {
+    setLogs((prev) => [...prev.slice(-50), `[${new Date().toLocaleTimeString()}] ${message}`]);
+  };
+
+  const testWithSample = () => {
+    if (!systemReady) {
+      addLog('System is processing or playing - sample test blocked');
+      return;
+    }
+    const sampleQuestion =
+      'مجھے یہ بتاؤ کہ گندم میں کیڑے مارنے کے لیے کون سی زہر یوز کرنی چاہیے۔';
+    setTranscribedText(sampleQuestion);
+    addLog(`Testing with sample: ${sampleQuestion}`);
+    setSystemReady(false);
+    setIsMicBlocked(true);
+
+    axios
+      .post('http://localhost:5000/process_text', { text: sampleQuestion })
+      .then((response) => {
+        setResponseText(response.data.response);
+        addLog(`Sample response received: ${response.data.response}`);
+        setConversationHistory((prev) => [
+          ...prev,
+          { question: sampleQuestion, answer: response.data.response },
+        ]);
+        setIsMicBlocked(false);
+        setSystemReady(true);
+      })
+      .catch((error) => {
+        addLog(`Sample test error: ${error.message}`);
+        setIsMicBlocked(false);
+        setSystemReady(true);
+      });
+  };
+
+  return (
+    <div className="min-h-screen bg-gradient-to-b from-green-50 to-green-100 flex flex-col">
+      <header className="bg-gradient-to-r from-green-700 to-green-600 text-white p-4 shadow-md">
+        <div className="container mx-auto flex items-center justify-between">
+          <div className="flex items-center">
+            <Wheat size={32} className="mr-3" />
+            <div>
+              <h1 className="text-3xl font-bold">AgriBot</h1>
+              <p className="text-sm opacity-80">Urdu Wheat Farming Assistant</p>
+            </div>
+          </div>
+          <div className="flex items-center space-x-2">
+            <span
+              className={`inline-block w-3 h-3 rounded-full ${
+                connectionStatus === 'connected' ? 'bg-green-300' : 'bg-red-500'
+              }`}
+            ></span>
+            <span className="text-sm">
+              {connectionStatus === 'connected' ? 'Connected' : 'Disconnected'}
+            </span>
+          </div>
+        </div>
+      </header>
+
+      <nav className="bg-green-600 text-white shadow-md">
+        <div className="container mx-auto flex">
+          <button
+            onClick={() => setActiveTab('main')}
+            className={`px-6 py-3 flex items-center text-lg transition-colors duration-200 ${
+              activeTab === 'main' ? 'bg-green-800' : 'hover:bg-green-700'
+            }`}
+          >
+            <Mic size={20} className="mr-2" /> Main
+          </button>
+          <button
+            onClick={() => setActiveTab('history')}
+            className={`px-6 py-3 flex items-center text-lg transition-colors duration-200 ${
+              activeTab === 'history' ? 'bg-green-800' : 'hover:bg-green-700'
+            }`}
+          >
+            <History size={20} className="mr-2" /> History
+          </button>
+          <button
+            onClick={() => setActiveTab('info')}
+            className={`px-6 py-3 flex items-center text-lg transition-colors duration-200 ${
+              activeTab === 'info' ? 'bg-green-800' : 'hover:bg-green-700'
+            }`}
+          >
+            <Info size={20} className="mr-2" /> About
+          </button>
+        </div>
+      </nav>
+
+      <div className="flex flex-1 overflow-hidden">
+        <main className="flex-1 p-6 container mx-auto">
+          {activeTab === 'main' && (
+            <>
+              <div className="bg-white rounded-lg shadow-lg p-8 mb-8 flex flex-col items-center border-l-4 border-green-500 transform hover:scale-[1.01] transition-transform duration-300">
+                <div className="flex items-center justify-center mb-6">
+                  <button
+                    onClick={toggleListening}
+                    className={`p-6 rounded-full ${
+                      !systemReady
+                        ? 'bg-gray-400 cursor-not-allowed'
+                        : isListening
+                        ? 'bg-red-500 hover:bg-red-600'
+                        : 'bg-green-600 hover:bg-green-700'
+                    } text-white transition-all duration-300 shadow-lg hover:shadow-xl transform hover:scale-105`}
+                    disabled={
+                      connectionStatus === 'disconnected' || !systemReady
+                    }
+                  >
+                    {isListening ? <MicOff size={32} /> : <Mic size={32} />}
+                  </button>
+                </div>
+
+                <div className="w-full mb-5">
+                  <div className="text-base text-gray-600 mb-2 flex justify-between">
+                    <span>Speech Probability</span>
+                    <span>{(speechProbability * 100).toFixed(2)}%</span>
+                  </div>
+                  <div className="w-full bg-gray-200 rounded-full h-3">
+                    <div
+                      className={`h-3 rounded-full transition-all duration-300 ${
+                        speechProbability > 0.7 ? 'bg-green-500' : 'bg-gray-400'
+                      }`}
+                      style={{ width: `${speechProbability * 100}%` }}
+                    ></div>
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-3 text-base text-gray-600">
+                  <span>Status:</span>
+                  {!systemReady ? (
+                    <span className="text-yellow-500 font-medium flex items-center gap-2">
+                      <span className="relative flex h-3 w-3">
+                        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-yellow-400 opacity-75"></span>
+                        <span className="relative inline-flex rounded-full h-3 w-3 bg-yellow-500"></span>
+                      </span>
+                      Processing
+                    </span>
+                  ) : isListening ? (
+                    <span className="text-green-500 font-medium flex items-center gap-2">
+                      <span className="relative flex h-3 w-3">
+                        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-green-400 opacity-75"></span>
+                        <span className="relative inline-flex rounded-full h-3 w-3 bg-green-500"></span>
+                      </span>
+                      Listening
+                    </span>
+                  ) : (
+                    <span className="text-gray-600 font-medium">Ready</span>
+                  )}
+                  {isMicBlocked && (
+                    <span className="text-green-600 font-medium flex items-center gap-2 ml-4">
+                      <Volume2 size={18} className="animate-pulse" />
+                      Responding
+                    </span>
+                  )}
+                </div>
+
+                {connectionStatus === 'disconnected' && (
+                  <div className="mt-5 text-red-500 text-base bg-red-50 p-3 rounded-md border border-red-200">
+                    Backend server not connected. Make sure the Python backend is running.
+                  </div>
+                )}
+
+                <div className="mt-6">
+                  <button
+                    onClick={testWithSample}
+                    className={`px-5 py-2.5 ${
+                      !systemReady
+                        ? 'bg-gray-100 text-gray-400 cursor-not-allowed'
+                        : 'bg-green-100 text-green-800 hover:bg-green-200'
+                    } rounded-md border border-green-300 text-base font-medium transition-colors duration-200`}
+                    disabled={!systemReady}
+                  >
+                    Test with Sample Question
+                  </button>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-8 mb-8">
+                <div className="bg-white rounded-lg shadow-lg p-6 border-l-4 border-green-400 transform hover:scale-[1.01] transition-transform duration-300">
+                  <h2 className="text-xl font-semibold mb-4 text-green-800 flex items-center">
+                    <Mic size={20} className="mr-2" /> Transcribed Text
+                  </h2>
+                  <div
+                    className="min-h-40 p-5 bg-green-50 rounded-md border border-green-200 text-right text-2xl gulzar-regular"
+                    dir="rtl"
+                    style={{ lineHeight: '2' }}
+                  >
+                    {transcribedText || (
+                      <span className="text-gray-400 italic">
+                        {isListening
+                          ? 'Listening for speech...'
+                          : 'Click the microphone button to start'}
+                      </span>
+                    )}
+                  </div>
+                </div>
+
+                <div className="bg-white rounded-lg shadow-lg p-6 border-l-4 border-green-400 transform hover:scale-[1.01] transition-transform duration-300">
+                  <h2 className="text-xl font-semibold mb-4 text-green-800 flex items-center">
+                    <Volume2 size={20} className="mr-2" /> AI Response
+                  </h2>
+                  <div
+                    className="min-h-40 p-5 bg-green-50 rounded-md border border-green-200 text-right text-2xl gulzar-regular"
+                    dir="rtl"
+                    style={{ lineHeight: '2' }}
+                  >
+                    {responseText || (
+                      <span className="text-gray-400 italic">
+                        Waiting for transcription...
+                      </span>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              <div className="bg-white rounded-lg shadow-lg p-6 flex-1 overflow-hidden border-l-4 border-green-500 transform hover:scale-[1.01] transition-transform duration-300">
+                <h2 className="text-xl font-semibold mb-4 text-green-800">
+                  System Logs
+                </h2>
+                <div className="bg-gray-900 text-green-400 p-4 rounded-md font-mono text-sm h-48 overflow-y-auto">
+                  {logs.length === 0 ? (
+                    <div className="text-gray-500">
+                      No logs yet. Start the system to see activity.
+                    </div>
+                  ) : (
+                    logs.map((log, index) => (
+                      <div key={index} className="mb-1">
+                        {log}
+                      </div>
+                    ))
+                  )}
+                </div>
+              </div>
+            </>
+          )}
+
+          {activeTab === 'history' && (
+            <div className="bg-white rounded-lg shadow-lg p-8 border-l-4 border-green-500 transform hover:scale-[1.01] transition-transform duration-300">
+              <h2 className="text-2xl font-semibold mb-6 text-green-800 flex items-center">
+                <History size={24} className="mr-3" /> Conversation History
+              </h2>
+              {conversationHistory.length === 0 ? (
+                <div className="text-gray-500 p-6 bg-green-50 rounded-md text-center text-lg">
+                  No conversation history yet. Start talking to AgriBot to see your conversations here.
+                </div>
+              ) : (
+                <div className="space-y-8">
+                  {conversationHistory.map((item, index) => (
+                    <div key={index} className="border-b border-green-100 pb-6">
+                      <div className="mb-4">
+                        <div className="font-medium text-green-800 mb-2 text-lg">
+                          Question:
+                        </div>
+                        <div
+                          className="p-4 bg-green-50 rounded-md text-right text-2xl gulzar-regular"
+                          dir="rtl"
+                          style={{ lineHeight: '2' }}
+                        >
+                          {item.question} {/* Fixed typo */}
+                        </div>
+                      </div>
+                      <div>
+                        <div className="font-medium text-green-800 mb-2 text-lg">
+                          Answer:
+                        </div>
+                        <div
+                          className="p-4 bg-green-50 rounded-md text-right text-2xl gulzar-regular"
+                          dir="rtl"
+                          style={{ lineHeight: '2' }}
+                        >
+                          {item.answer}
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {activeTab === 'info' && (
+            <div className="bg-white rounded-lg shadow-lg p-8 border-l-4 border-green-500 transform hover:scale-[1.01] transition-transform duration-300">
+              <h2 className="text-2xl font-semibold mb-6 text-green-800 flex items-center">
+                <Info size={24} className="mr-3" /> About AgriBot
+              </h2>
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-8">
+                <div className="bg-green-50 p-6 rounded-md border border-green-200">
+                  <h3 className="text-xl font-medium mb-4 text-green-700 flex items-center">
+                    <Leaf size={22} className="mr-2" /> What is AgriBot?
+                  </h3>
+                  <p className="text-gray-700 mb-5 text-lg leading-relaxed">
+                    AgriBot is an AI-powered voice assistant designed specifically for wheat farmers in Pakistan. It provides expert advice on wheat cultivation, pest control, irrigation, and other farming practices in Urdu language.
+                  </p>
+                  <h3 className="text-xl font-medium mb-4 text-green-700">
+                    System Components
+                  </h3>
+                  <ul className="list-disc pl-6 text-gray-700 space-y-2 mb-4 text-lg">
+                    <li>
+                      <span className="font-medium">Speech Recognition:</span>{' '}
+                      Whisper Model for accurate Urdu speech recognition
+                    </li>
+                    <li>
+                      <span className="font-medium">Voice Activity Detection:</span>{' '}
+                      Silero VAD for detecting when someone is speaking
+                    </li>
+                    <li>
+                      <span className="font-medium">AI Processing:</span> LLaMA 3.3 70B model for generating responses
+                    </li>
+                    <li>
+                      <span className="font-medium">Text-to-Speech:</span>{' '}
+                      ElevenLabs for natural-sounding Urdu voice responses
+                    </li>
+                  </ul>
+                </div>
+                <div className="bg-green-50 p-6 rounded-md border border-green-200">
+                  <h3 className="text-xl font-medium mb-4 text-green-700">
+                    How It Works
+                  </h3>
+                  <ol className="list-decimal pl-6 text-gray-700 space-y-3 mb-5 text-lg">
+                    <li>Click the microphone button to start listening</li>
+                    <li>Speak your question about wheat farming in Urdu</li>
+                    <li>The system detects when you've finished speaking</li>
+                    <li>Your speech is transcribed to text</li>
+                    <li>The AI generates a helpful response</li>
+                    <li>The response is converted to speech and played back</li>
+                  </ol>
+                  <h3 className="text-xl font-medium mb-4 text-green-700">
+                    Getting Started
+                  </h3>
+                  <p className="text-gray-700 text-lg leading-relaxed">
+                    Make sure the Python backend is running before using AgriBot. You can ask questions about:
+                  </p>
+                  <ul className="list-disc pl-6 text-gray-700 space-y-2 mt-3 text-lg">
+                    <li>Wheat planting times and techniques</li>
+                    <li>Seed varieties and quantities</li>
+                    <li>Irrigation schedules</li>
+                    <li>Pest control and disease prevention</li>
+                    <li>Harvesting best practices</li>
+                  </ul>
+                </div>
+              </div>
+            </div>
+          )}
+        </main>
+      </div>
+
+      <footer className="bg-green-800 text-white p-4 text-center">
+        <p className="text-base">© 2025 AgriBot - Wheat Farming Assistant | Powered by AI</p>
+      </footer>
+    </div>
+  );
+}
+
+export default App;
+import time
+import numpy as np
+import torch
+from faster_whisper import WhisperModel
+from groq import Groq
+from dotenv import load_dotenv
+from elevenlabs.client import ElevenLabs
+import os
+from flask import Flask, request, jsonify
+from flask_socketio import SocketIO
+from flask_cors import CORS
+import threading
+import tempfile
+import io
+import queue
+import wave
+
+app = Flask(__name__)
+CORS(app)
+socketio = SocketIO(app, cors_allowed_origins="*")
+
+load_dotenv()
+
+system_prompt = """
+You are an AI assistant designed to provide crucial agricultural guidance to wheat farmers. Your responses must be in Urdu, concise, and focused on wheat cultivation practices, including sowing times, irrigation schedules, seed varieties, weed control, disease prevention, and other farming advice. Tailor your responses to specific seasons, conditions, and geographical contexts to help farmers optimize wheat yields.
+
+### Key Guidelines:
+- **Sowing Time**: 1st to 15th November is optimal for wheat cultivation.  
+- **Seed Quantity**: Use 50 kg/acre if sown by 15th November; increase to 60 kg/acre afterward.  
+- **Land Preparation**: Use rotavators and double ploughing after clearing cotton, maize, or sugarcane fields.  
+- **Seed Varieties**: Recommend GA 2002, Aqab 2000, NARC 2009 for rainfed areas; Aqab 2000, Punjab-1 for irrigated zones.  
+- **Irrigation**: Perform "Herrio" twice after the first watering. In rainfed areas, deep ploughing helps retain rainwater.  
+- **Pest Control**: Monitor for aphid attacks and use approved insecticides. Avoid spraying during fog, wind, or rain.  
+- **Weed Management**: Use flat-fan nozzles for herbicide application.  
+
+### Example Interaction:
+**User Query (Urdu)**:  
+"مجھے یہ بتاؤ کہ گندم میں کیڑے مارنے کے لیے کون سی زہر یوز کرنی چاہیے۔"  
+
+**Your Response (Urdu)**:  
+**گندم کے کیڑوں کے لیے سفارش کردہ زہر**:  
+- **ایندوسلفن**: وسیع الطیف زہر، سست تیلے اور مکڑیوں کے خلاف مؤثر۔  
+- **سیالوٹرن**: سست تیلے کے لیے بہترین۔  
+- **ایمیٹاف**: تیزی سے اثر کرنے والا۔  
+**ہدایات**: زہر کا استعمال ہدایت کے مطابق کریں۔ سپرے سے پہلے موسم کی پیشگوئی ضرور چیک کریں۔  
+
+### Rules:
+1. **Urdu Responses Only**: All answers must be in Urdu, using simple language for farmers.  
+2. **Conciseness**: Keep responses under 4-5 lines unless details are critical.  
+3. **Topic Enforcement**: Politely redirect users to agriculture-related queries if they deviate.  
+4. **Urgent Issues**: Prioritize warnings (e.g., pest outbreaks, weather risks) in bold.  
+"""
+
+try:
+    tts_client = ElevenLabs(api_key=os.getenv("ELEVENLABS_API_KEY", "sk_47693bddc28209f1fddc944af4898cae6ffd4f14800c7525"))
+    client = Groq(api_key=os.getenv("GROQ_API_KEY", "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"))
+    print("API clients initialized successfully")
+except Exception as e:
+    print(f"Error initializing API clients: {e}")
+
+try:
+    vad_model, utils = torch.hub.load(repo_or_dir='snakers4/silero-vad', model='silero_vad', force_reload=True)
+    (get_speech_timestamps, _, _, _, _) = utils
+    print("VAD model loaded successfully")
+except Exception as e:
+    print(f"Error loading VAD model: {e}")
+    vad_model = None
+    utils = None
+
+try:
+    model_size = "large-v3-turbo"
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    compute_type = "float16" if device == "cuda" else "int8"
+    whisper_model = WhisperModel(model_size, device=device, compute_type=compute_type)
+    print(f"Whisper model loaded successfully on {device}")
+except Exception as e:
+    print(f"Error loading Whisper model: {e}")
+    whisper_model = None
+
+RATE = 16000
+CHANNELS = 1
+VAD_CHUNK_SIZE = 512  # Silero VAD expects 512 samples at 16kHz
+SILENCE_THRESHOLD = 2.0
+SPEECH_THRESHOLD = 0.7  # Increased from 0.5 to reduce sensitivity
+
+audio_queue = queue.Queue(maxsize=10)
+audio_buffer = bytearray()  # Buffer for raw PCM data during speech
+last_voice_time = time.time()
+is_listening = False
+is_speaking = False
+
+def process_audio_data(data):
+    """Process PCM audio chunks for VAD and accumulate buffer when speech is detected."""
+    global last_voice_time, audio_buffer, is_speaking
+    try:
+        audio_np = np.frombuffer(data, dtype=np.float32)
+        audio_int16 = (audio_np * 32767).astype(np.int16)
+        audio_data = audio_int16.tobytes()
+
+        audio_tensor = torch.from_numpy(audio_np).unsqueeze(0)
+        speech_prob = vad_model(audio_tensor, sr=RATE).mean().item()
+        socketio.emit('speech_probability', {'probability': speech_prob})
+        print(f"Speech probability: {speech_prob}")
+
+        if speech_prob > SPEECH_THRESHOLD and not is_speaking:
+            print("Speech started, beginning accumulation")
+            is_speaking = True
+            audio_buffer = bytearray()
+            audio_buffer.extend(audio_data)
+            last_voice_time = time.time()
+        elif speech_prob > SPEECH_THRESHOLD and is_speaking:
+            audio_buffer.extend(audio_data)
+            last_voice_time = time.time()
+        elif speech_prob <= SPEECH_THRESHOLD and is_speaking:
+            audio_buffer.extend(audio_data)
+            if (time.time() - last_voice_time) > SILENCE_THRESHOLD:
+                print(f"Silence detected after speech, buffer size: {len(audio_buffer)} bytes")
+                is_speaking = False
+                # Emit event to block mic before transcription starts
+                socketio.emit('start_processing')
+                return True
+        return False
+    except Exception as e:
+        print(f"Error processing audio chunk for VAD: {e}")
+        if is_speaking:
+            audio_buffer.extend(audio_data)
+            if (time.time() - last_voice_time) > SILENCE_THRESHOLD:
+                print(f"Silence detected (fallback), buffer size: {len(audio_buffer)} bytes")
+                is_speaking = False
+                # Emit event to block mic before transcription starts
+                socketio.emit('start_processing')
+                return True
+        return False
+
+def transcribe_audio(audio_data):
+    """Transcribe audio from accumulated PCM data."""
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
+            with wave.open(temp_file.name, 'wb') as wf:
+                wf.setnchannels(CHANNELS)
+                wf.setsampwidth(2)
+                wf.setframerate(RATE)
+                wf.writeframes(audio_data)
+            wav_filename = temp_file.name
+
+        print(f"Saved PCM data to WAV: {wav_filename}, size: {len(audio_data)} bytes")
+
+        segments, info = whisper_model.transcribe(wav_filename, beam_size=5, language="ur")
+        print(f"Detected language '{info.language}' with probability {info.language_probability}")
+        transcribed_text = " ".join([segment.text for segment in segments])
+        print(f"Transcribed Text: {transcribed_text}")
+
+        os.unlink(wav_filename)
+        return transcribed_text
+    except Exception as e:
+        print(f"Error transcribing audio: {e}")
+        return None
+
+def get_ai_response(text):
+    """Generate AI response using Groq."""
+    try:
+        chat_completion = client.chat.completions.create(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": text}
+            ],
+            model="llama-3.3-70b-versatile",
+            temperature=0.3,
+            max_tokens=500,
+            top_p=0.9,
+            frequency_penalty=0,
+            presence_penalty=0,
+        )
+        response_text = chat_completion.choices[0].message.content
+        print(f"Groq Response: {response_text}")
+        return response_text
+    except Exception as e:
+        print(f"Error getting AI response: {e}")
+        return "معذرت، میں آپ کی درخواست پر عمل نہیں کر سکا۔"
+
+def generate_audio_response(text):
+    """Generate audio from text and return as bytes."""
+    try:
+        audio_response = tts_client.text_to_speech.convert(
+            text=text,
+            voice_id="Sxk6njaoa7XLsAFT7WcN",
+            model_id="eleven_multilingual_v2",
+            output_format="mp3_44100_128",
+        )
+        audio_bytes = b''.join(chunk for chunk in audio_response)
+        print(f"Generated audio response, size: {len(audio_bytes)} bytes")
+        return audio_bytes
+    except Exception as e:
+        print(f"Error generating audio response: {e}")
+        return None
+
+def process_voice_input(audio_segment):
+    """Process a complete audio segment."""
+    try:
+        transcribed_text = transcribe_audio(audio_segment)
+        if transcribed_text and transcribed_text.strip():
+            socketio.emit('transcribed_text', {'text': transcribed_text})
+            response_text = get_ai_response(transcribed_text)
+            audio_data = generate_audio_response(response_text)
+            if audio_data:
+                socketio.emit('response', {'text': response_text, 'audio': audio_data})
+            else:
+                socketio.emit('response', {'text': response_text})
+        else:
+            print("No valid transcription; skipping processing.")
+    except Exception as e:
+        print(f"Error processing voice input: {e}")
+
+def audio_processing_worker():
+    """Worker thread to process audio segments from the queue."""
+    while True:
+        audio_segment = audio_queue.get()
+        if audio_segment is None:
+            break
+        process_voice_input(audio_segment)
+        audio_queue.task_done()
+
+@socketio.on('connect')
+def handle_connect():
+    print('Client connected')
+
+@socketio.on('disconnect')
+def handle_disconnect():
+    print('Client disconnected')
+
+@socketio.on('start_listening')
+def handle_start_listening():
+    global is_listening, audio_buffer, last_voice_time, is_speaking
+    if is_listening:
+        return
+    print("Starting listening...")
+    audio_buffer = bytearray()
+    last_voice_time = time.time()
+    is_speaking = False
+    is_listening = True
+
+@socketio.on('stop_listening')
+def handle_stop_listening():
+    global is_listening, audio_buffer, is_speaking
+    if not is_listening:
+        return
+    print("Stopping listening...")
+    is_listening = False
+    if audio_buffer and is_speaking:
+        if not audio_queue.full():
+            print(f"Enqueuing buffer on stop: {len(audio_buffer)} bytes")
+            audio_queue.put(bytes(audio_buffer))
+        else:
+            print("Audio queue full. Dropping segment.")
+    audio_buffer = bytearray()
+    is_speaking = False
+
+@socketio.on('audio_chunk')
+def handle_audio_chunk(data):
+    global is_listening, audio_buffer
+    audio_data = data['audio']
+    print(f"Received audio chunk of size {len(audio_data)} bytes")
+    if not is_listening:
+        return
+    if process_audio_data(audio_data):
+        print("Silence detected. Enqueuing recorded audio segment...")
+        if not audio_queue.full():
+            print(f"Enqueuing buffer: {len(audio_buffer)} bytes")
+            audio_queue.put(bytes(audio_buffer))
+        else:
+            print("Audio queue full. Dropping segment.")
+        audio_buffer = bytearray()
+
+@socketio.on('check_ready')
+def handle_check_ready():
+    socketio.emit('system_ready', {'ready': True})
+
+@app.route('/process_text', methods=['POST'])
+def process_text():
+    try:
+        data = request.json
+        text = data.get('text', '')
+        if not text:
+            return jsonify({'error': 'No text provided'}), 400
+        response_text = get_ai_response(text)
+        audio_data = generate_audio_response(response_text)
+        if audio_data:
+            socketio.emit('response', {'text': response_text, 'audio': audio_data})
+        return jsonify({'response': response_text})
+    except Exception as e:
+        print(f"Error processing text: {e}")
+        return jsonify({'error': str(e)}), 500
+
+if __name__ == '__main__':
+    try:
+        worker_thread = threading.Thread(target=audio_processing_worker, daemon=True)
+        worker_thread.start()
+        print("Starting server on http://localhost:5000")
+        socketio.run(app, host='0.0.0.0', port=5000, debug=True, allow_unsafe_werkzeug=True)
+    except KeyboardInterrupt:
+        print("Server stopped by user")
+    except Exception as e:
+        print(f"Error starting server: {e}")
+    finally:
+        audio_queue.put(None)

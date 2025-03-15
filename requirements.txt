@@ -1,0 +1,11 @@
+flask
+flask-socketio
+flask-cors
+python-dotenv
+numpy
+torch
+pyaudio
+faster-whisper
+groq
+elevenlabs
+torchaudio
