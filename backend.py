@@ -1,27 +1,27 @@
 import time
 import numpy as np
 import torch
+import json
+import os
 from faster_whisper import WhisperModel
 from groq import Groq
 from dotenv import load_dotenv
 from elevenlabs.client import ElevenLabs
-import os
 from flask import Flask, request, jsonify
 from flask_socketio import SocketIO
 from flask_cors import CORS
 import threading
 import tempfile
-import io
 import queue
 import wave
 
 app = Flask(__name__)
-CORS(app, resources={r"/*": {"origins": "*"}})  # Allow all origins for HTTP
-socketio = SocketIO(app, cors_allowed_origins="*")  # Allow all origins for WebSocket
+CORS(app, resources={r"/*": {"origins": "*"}})
+socketio = SocketIO(app, cors_allowed_origins="*")
 
 load_dotenv()
 
-system_prompt = """
+BASE_SYSTEM_PROMPT = """
 You are an AI assistant designed to provide crucial agricultural guidance to wheat farmers. Your responses must be in Urdu, concise, and focused on wheat cultivation practices, including sowing times, irrigation schedules, seed varieties, weed control, disease prevention, and other farming advice. Tailor your responses to specific seasons, conditions, and geographical contexts to help farmers optimize wheat yields.
 
 ### Key Guidelines:
@@ -51,6 +51,15 @@ You are an AI assistant designed to provide crucial agricultural guidance to whe
 4. **Urgent Issues**: Prioritize warnings (e.g., pest outbreaks, weather risks) in bold.  
 """
 
+CONVERSATION_HISTORY_FILE = "conversation_history.json"
+conversation_history = []
+history_lock = threading.Lock()
+MAX_HISTORY_LENGTH = 5
+
+if not os.path.exists(CONVERSATION_HISTORY_FILE):
+    with open(CONVERSATION_HISTORY_FILE, "w", encoding="utf-8") as f:
+        json.dump([], f, ensure_ascii=False, indent=4)
+
 try:
     tts_client = ElevenLabs(api_key=os.getenv("ELEVENLABS_API_KEY", "sk_47693bddc28209f1fddc944af4898cae6ffd4f14800c7525"))
     client = Groq(api_key=os.getenv("GROQ_API_KEY", "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"))
@@ -59,13 +68,11 @@ except Exception as e:
     print(f"Error initializing API clients: {e}")
 
 try:
-    vad_model, utils = torch.hub.load(repo_or_dir='snakers4/silero-vad', model='silero_vad', force_reload=True)
-    (get_speech_timestamps, _, _, _, _) = utils
+    vad_model, utils = torch.hub.load('snakers4/silero-vad', 'silero_vad', force_reload=True)
     print("VAD model loaded successfully")
 except Exception as e:
     print(f"Error loading VAD model: {e}")
     vad_model = None
-    utils = None
 
 try:
     model_size = "large-v3-turbo"
@@ -79,7 +86,6 @@ except Exception as e:
 
 RATE = 16000
 CHANNELS = 1
-VAD_CHUNK_SIZE = 512  # Silero VAD expects 512 samples at 16kHz
 SILENCE_THRESHOLD = 2.0
 SPEECH_THRESHOLD = 0.7
 
@@ -88,10 +94,29 @@ audio_buffer = bytearray()
 last_voice_time = time.time()
 is_listening = False
 is_speaking = False
-is_processing = False  # New flag to track processing state
+is_processing = False
+
+def save_conversation_history():
+    with open(CONVERSATION_HISTORY_FILE, "w", encoding="utf-8") as f:
+        json.dump(conversation_history, f, ensure_ascii=False, indent=4)
+
+def update_conversation_history(user_message, assistant_response):
+    global conversation_history
+    with history_lock:
+        conversation_history.append({"role": "user", "content": user_message})
+        conversation_history.append({"role": "assistant", "content": assistant_response})
+        if len(conversation_history) > MAX_HISTORY_LENGTH * 2:
+            conversation_history = conversation_history[-MAX_HISTORY_LENGTH * 2:]
+        save_conversation_history()
+
+def get_conversation_context():
+    with history_lock:
+        history = conversation_history[-MAX_HISTORY_LENGTH * 2:] if len(conversation_history) > MAX_HISTORY_LENGTH * 2 else conversation_history
+    if not history:
+        return "ابھی تک کوئی گفتگو نہیں ہوئی۔"
+    return "\n".join([f"{entry['role']}: {entry['content']}" for entry in history])
 
 def process_audio_data(data):
-    """Process PCM audio chunks for VAD and accumulate buffer when speech is detected."""
     global last_voice_time, audio_buffer, is_speaking, is_processing
     if is_processing:
         print("Processing in progress, skipping new audio chunk")
@@ -110,7 +135,7 @@ def process_audio_data(data):
         if speech_prob > SPEECH_THRESHOLD and not is_speaking:
             print("Speech started, beginning accumulation")
             is_speaking = True
-            audio_buffer = bytearray()
+            audio_buffer = bytearray()  # Reset buffer at start of speech
             audio_buffer.extend(audio_data)
             last_voice_time = time.time()
         elif speech_prob > SPEECH_THRESHOLD and is_speaking:
@@ -127,18 +152,10 @@ def process_audio_data(data):
         return False
     except Exception as e:
         print(f"Error processing audio chunk for VAD: {e}")
-        if is_speaking:
-            audio_buffer.extend(audio_data)
-            if (time.time() - last_voice_time) > SILENCE_THRESHOLD:
-                print(f"Silence detected (fallback), buffer size: {len(audio_buffer)} bytes")
-                is_speaking = False
-                is_processing = True
-                socketio.emit('start_processing')
-                return True
+        is_speaking = False  # Reset speaking state on error
         return False
 
 def transcribe_audio(audio_data):
-    """Transcribe audio from accumulated PCM data."""
     try:
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
             with wave.open(temp_file.name, 'wb') as wf:
@@ -153,7 +170,6 @@ def transcribe_audio(audio_data):
         print(f"Detected language '{info.language}' with probability {info.language_probability}")
         transcribed_text = " ".join([segment.text for segment in segments])
         print(f"Transcribed Text: {transcribed_text}")
-
         os.unlink(wav_filename)
         return transcribed_text
     except Exception as e:
@@ -161,11 +177,13 @@ def transcribe_audio(audio_data):
         return None
 
 def get_ai_response(text):
-    """Generate AI response using Groq."""
     try:
+        conversation_context = get_conversation_context()
+        full_prompt = f"{BASE_SYSTEM_PROMPT}\n## گفتگو کا خلاصہ:\n{conversation_context}"
+        
         chat_completion = client.chat.completions.create(
             messages=[
-                {"role": "system", "content": system_prompt},
+                {"role": "system", "content": full_prompt},
                 {"role": "user", "content": text}
             ],
             model="llama-3.3-70b-versatile",
@@ -177,13 +195,13 @@ def get_ai_response(text):
         )
         response_text = chat_completion.choices[0].message.content
         print(f"Groq Response: {response_text}")
+        update_conversation_history(text, response_text)
         return response_text
     except Exception as e:
         print(f"Error getting AI response: {e}")
         return "معذرت، میں آپ کی درخواست پر عمل نہیں کر سکا۔"
 
 def generate_audio_response(text):
-    """Generate audio from text and return as bytes."""
     try:
         audio_response = tts_client.text_to_speech.convert(
             text=text,
@@ -199,26 +217,18 @@ def generate_audio_response(text):
         return None
 
 def process_voice_input(audio_segment):
-    global is_processing
+    global is_processing, is_listening
     try:
-        print("Starting transcription")
         transcribed_text = transcribe_audio(audio_segment)
         if transcribed_text and transcribed_text.strip():
-            print(f"Transcription complete: {transcribed_text}")
             socketio.emit('transcribed_text', {'text': transcribed_text})
-            print("Generating AI response")
             response_text = get_ai_response(transcribed_text)
-            print("Generating audio response")
             audio_data = generate_audio_response(response_text)
             if audio_data:
                 socketio.emit('audio_playing')
                 socketio.emit('response', {'text': response_text, 'audio': audio_data})
-                print("Response sent with audio")
             else:
                 socketio.emit('response', {'text': response_text})
-                print("Response sent without audio")
-                is_processing = False  # Reset here if no audio
-                socketio.emit('system_ready', {'ready': True})
         else:
             print("No valid transcription; skipping processing")
             is_processing = False
@@ -230,15 +240,14 @@ def process_voice_input(audio_segment):
 
 @socketio.on('audio_ended')
 def handle_audio_ended():
-    global is_processing
-    print("Received audio_ended event from frontend")
+    global is_processing, is_listening
+    print("Audio playback confirmed ended")
     is_processing = False
     socketio.emit('system_ready', {'ready': True})
-
-
+    if not is_listening:
+        print("Listening stopped after audio playback")
 
 def audio_processing_worker():
-    """Worker thread to process audio segments from the queue."""
     while True:
         audio_segment = audio_queue.get()
         if audio_segment is None:
@@ -249,15 +258,19 @@ def audio_processing_worker():
 @socketio.on('connect')
 def handle_connect():
     print('Client connected')
+    socketio.emit('system_ready', {'ready': True})
 
 @socketio.on('disconnect')
 def handle_disconnect():
+    global is_listening
     print('Client disconnected')
+    is_listening = False
 
 @socketio.on('start_listening')
 def handle_start_listening():
     global is_listening, audio_buffer, last_voice_time, is_speaking, is_processing
     if is_listening or is_processing:
+        print("Already listening or processing, ignoring start_listening")
         return
     print("Starting listening...")
     audio_buffer = bytearray()
@@ -270,6 +283,7 @@ def handle_start_listening():
 def handle_stop_listening():
     global is_listening, audio_buffer, is_speaking
     if not is_listening:
+        print("Not listening, ignoring stop_listening")
         return
     print("Stopping listening...")
     is_listening = False
@@ -284,19 +298,23 @@ def handle_stop_listening():
 
 @socketio.on('audio_chunk')
 def handle_audio_chunk(data):
-    global is_listening, audio_buffer
-    audio_data = data['audio']
-    print(f"Received audio chunk of size {len(audio_data)} bytes")
+    global is_listening, audio_buffer, is_processing
     if not is_listening or is_processing:
+        print("Skipping audio chunk: not listening or processing")
         return
-    if process_audio_data(audio_data):
-        print("Silence detected. Enqueuing recorded audio segment...")
-        if not audio_queue.full():
-            print(f"Enqueuing buffer: {len(audio_buffer)} bytes")
-            audio_queue.put(bytes(audio_buffer))
-        else:
-            print("Audio queue full. Dropping segment.")
-        audio_buffer = bytearray()
+    try:
+        if process_audio_data(data['audio']):
+            if not audio_queue.full():
+                print(f"Enqueuing buffer: {len(audio_buffer)} bytes")
+                audio_queue.put(bytes(audio_buffer))
+            else:
+                print("Audio queue full. Dropping segment.")
+            audio_buffer = bytearray()  # Reset buffer after enqueuing
+    except Exception as e:
+        print(f"Error handling audio chunk: {e}")
+        audio_buffer = bytearray()  # Reset buffer on error
+        is_processing = False
+        socketio.emit('system_ready', {'ready': True})
 
 @socketio.on('check_ready')
 def handle_check_ready():
@@ -305,7 +323,7 @@ def handle_check_ready():
 
 @app.route('/process_text', methods=['POST'])
 def process_text():
-    global is_processing
+    global is_processing, is_listening
     if is_processing:
         return jsonify({'error': 'System is currently processing'}), 429
     try:
@@ -315,6 +333,7 @@ def process_text():
         text = data.get('text', '')
         if not text:
             is_processing = False
+            socketio.emit('system_ready', {'ready': True})
             return jsonify({'error': 'No text provided'}), 400
         response_text = get_ai_response(text)
         audio_data = generate_audio_response(response_text)
