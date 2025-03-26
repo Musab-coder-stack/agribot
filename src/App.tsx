@@ -3,7 +3,7 @@ import { Mic, MicOff, Volume2, Leaf, Wheat, Info, History } from 'lucide-react';
 import { io } from 'socket.io-client';
 import axios from 'axios';
 
-const socket = io('https://colt-immortal-bream.ngrok-free.app', {
+const socket = io('http://localhost:5000', {
   transports: ['websocket'],
   reconnection: true,
   reconnectionAttempts: 5,
@@ -214,7 +214,7 @@ function App() {
     setSystemReady(false);
 
     axios
-      .post('https://colt-immortal-bream.ngrok-free.app/process_text', { text: sampleQuestion })
+      .post('http://localhost:5000/process_text', { text: sampleQuestion })
       .then((response) => {
         setResponseText(response.data.response);
         addLog(`Sample response received: ${response.data.response}`);
